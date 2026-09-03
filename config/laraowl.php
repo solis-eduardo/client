@@ -45,4 +45,15 @@ return [
         'timeout' => (float) env('LARAOWL_INGEST_TIMEOUT', 2.0),
         'buffer_size' => (int) env('LARAOWL_INGEST_BUFFER', 500),
     ],
+
+    // Queue Settings
+    //
+    // When a connection or queue is set, the HTTP POST to the Laraowl server is
+    // dispatched to a queued job instead of blocking the request/command while
+    // it completes. Leave both empty to keep the current synchronous behavior.
+    'queue' => [
+        'connection' => env('LARAOWL_QUEUE_CONNECTION'),
+        'queue' => env('LARAOWL_QUEUE', 'laraowl'),
+        'delay' => (int) env('LARAOWL_QUEUE_DELAY', 0),
+    ],
 ];
