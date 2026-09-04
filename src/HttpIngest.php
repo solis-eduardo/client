@@ -122,6 +122,43 @@ final class HttpIngest implements IngestContract
                 $job->delay(now()->addSeconds($delay));
             }
 
+            $this->dispatchUnsampled($job);
+
+            return;
+        }
+
+        // No queue connection configured: fall back to the synchronous
+        // transmit, same as Telescope falling back to sync when
+        // TELESCOPE_QUEUE is empty. LARAOWL_QUEUE only takes effect once
+        // LARAOWL_QUEUE_CONNECTION opts into queueing.
+        $this->transmitBatch($records);
+    }
+
+    /**
+     * Push the transmit job with sampling explicitly turned off in the
+     * context Laravel dehydrates into the job payload.
+     *
+     * Core::prepareForJob() restores the sampling flag from the payload, and
+     * Compatibility::getSamplingFromContext() defaults to *true* when the key
+     * is absent -- so the transmit job would otherwise run sampled. On a
+     * database queue connection the driver's own SQL (the reserve/pop on the
+     * way in, the delete on the way out) is captured by QuerySensor like any
+     * other query, so the next Looping event would digest those records and
+     * dispatch another transmit job, whose own driver SQL would do the same:
+     * an endless chain of jobs with no application traffic behind it.
+     * Marking the payload unsampled makes Core::finishExecution() flush()
+     * that buffer instead of digest()ing it, cutting the chain at the source.
+     * The TransmitRecords guards in QueuedJobSensor and JobAttemptSensor
+     * remain as a second line of defence for setups where the context never
+     * reaches the payload.
+     */
+    private function dispatchUnsampled(TransmitRecords $job): void
+    {
+        $cachedSampling = Compatibility::getSamplingFromContext(null);
+
+        try {
+            Compatibility::addSamplingToContext(false);
+
             // Dispatch explicitly through the bus instead of the fluent
             // TransmitRecords::dispatch(...) static helper: that helper
             // returns a PendingDispatch which only actually pushes the job
@@ -132,15 +169,13 @@ final class HttpIngest implements IngestContract
             // shutdown). Dispatching explicitly pushes immediately and
             // removes that timing dependency entirely.
             app(Dispatcher::class)->dispatch($job);
-
-            return;
+        } finally {
+            if ($cachedSampling === null) {
+                Compatibility::removeSamplingFromContext();
+            } else {
+                Compatibility::addSamplingToContext($cachedSampling);
+            }
         }
-
-        // No queue connection configured: fall back to the synchronous
-        // transmit, same as Telescope falling back to sync when
-        // TELESCOPE_QUEUE is empty. LARAOWL_QUEUE only takes effect once
-        // LARAOWL_QUEUE_CONNECTION opts into queueing.
-        $this->transmitBatch($records);
     }
 
     /**
