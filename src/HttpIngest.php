@@ -42,6 +42,12 @@ final class HttpIngest implements IngestContract
         }
     }
 
+    /**
+     * Deliberately synchronous even when queueing is enabled: the callers of
+     * this path (Core::record() and the FatalError branch of report()) need
+     * the record on the wire before the process can go away, which a queued
+     * job cannot guarantee. It still blocks for up to LARAOWL_INGEST_TIMEOUT.
+     */
     public function writeNow(array $record): void
     {
         $this->transmitBatch([$record]);

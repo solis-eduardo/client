@@ -53,9 +53,15 @@ return [
     // it completes. Leave LARAOWL_QUEUE_CONNECTION empty to keep the current
     // synchronous behavior; LARAOWL_QUEUE only names which queue to use once
     // queueing is enabled.
+    //
+    // LARAOWL_QUEUE defaults to null, meaning the connection's own default
+    // queue -- so setting LARAOWL_QUEUE_CONNECTION alone is enough and a
+    // stock `php artisan queue:work <connection>` picks the batches up. Name
+    // a queue here only if you also run a worker listening on it, otherwise
+    // the batches pile up unprocessed and telemetry stops with no error.
     'queue' => [
         'connection' => env('LARAOWL_QUEUE_CONNECTION'),
-        'queue' => env('LARAOWL_QUEUE', 'laraowl'),
+        'queue' => env('LARAOWL_QUEUE'),
         'delay' => (int) env('LARAOWL_QUEUE_DELAY', 0),
     ],
 ];
