@@ -4,11 +4,17 @@ namespace Laraowl\Client;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Contracts\Bus\Dispatcher;
+use Illuminate\Support\Facades\Log;
+use JsonException;
 use Laraowl\Client\Contracts\Ingest as IngestContract;
 use Laraowl\Client\Jobs\TransmitRecords;
 use Throwable;
 
+use function app;
 use function config;
+use function json_decode;
+use function json_encode;
 use function now;
 
 /**
@@ -75,13 +81,51 @@ final class HttpIngest implements IngestContract
         $connection = $queueConfig['connection'] ?? null;
 
         if ($connection) {
-            $job = TransmitRecords::dispatch($records)
+            // Queued jobs are serialized with PHP's native serialize(), not
+            // json_encode(). Some record fields (e.g. the request record's
+            // "user" key, RequestState::$user->id()) are LazyValue instances
+            // -- JsonSerializable wrappers around a Closure, meant to be
+            // resolved lazily by json_encode() on the synchronous transmit
+            // path (see transmitBatch()/Payload::json()). A Closure can
+            // never be serialize()'d, so constructing the job with these
+            // still-lazy records throws "Serialization of 'Closure' is not
+            // allowed" the moment it's actually pushed onto the queue --
+            // and that exception is swallowed silently by
+            // Core::finishExecution(), losing the record with no error
+            // anywhere. Round-tripping through JSON here resolves every
+            // LazyValue (and anything else JsonSerializable) into a plain,
+            // natively serializable value -- exactly what would happen
+            // anyway once the batch is eventually sent over HTTP.
+            try {
+                $records = json_decode(
+                    json_encode($records, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE),
+                    true,
+                    flags: JSON_THROW_ON_ERROR
+                );
+            } catch (JsonException $e) {
+                Log::error('Laraowl Ingest Error: failed to prepare records for queueing: '.$e->getMessage());
+
+                return;
+            }
+
+            $job = (new TransmitRecords($records))
                 ->onConnection($connection)
                 ->onQueue($queueConfig['queue'] ?? null);
 
             if ($delay = $queueConfig['delay'] ?? 0) {
                 $job->delay(now()->addSeconds($delay));
             }
+
+            // Dispatch explicitly through the bus instead of the fluent
+            // TransmitRecords::dispatch(...) static helper: that helper
+            // returns a PendingDispatch which only actually pushes the job
+            // in its __destruct(), when the local variable goes out of
+            // scope. That's unreliable this late in the request lifecycle
+            // (digest() is invoked from the very last hook Laravel's HTTP
+            // kernel runs in Kernel::terminate(), right before script
+            // shutdown). Dispatching explicitly pushes immediately and
+            // removes that timing dependency entirely.
+            app(Dispatcher::class)->dispatch($job);
 
             return;
         }
