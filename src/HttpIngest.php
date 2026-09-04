@@ -110,7 +110,13 @@ final class HttpIngest implements IngestContract
 
             $job = (new TransmitRecords($records))
                 ->onConnection($connection)
-                ->onQueue($queueConfig['queue'] ?? null);
+                // The inner `?? null` only covers the key being absent (per
+                // the array-shape above) so PHPStan can see the offset is
+                // safe; the outer `?: null` is what actually matters here --
+                // it also treats an explicit LARAOWL_QUEUE='' as "not
+                // configured" instead of pushing to a queue literally named
+                // '', which most workers don't listen on by default.
+                ->onQueue(($queueConfig['queue'] ?? null) ?: null);
 
             if ($delay = $queueConfig['delay'] ?? 0) {
                 $job->delay(now()->addSeconds($delay));
