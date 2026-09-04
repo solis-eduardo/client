@@ -6,7 +6,6 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\Log;
-use JsonException;
 use Laraowl\Client\Contracts\Ingest as IngestContract;
 use Laraowl\Client\Jobs\TransmitRecords;
 use Throwable;
@@ -96,13 +95,22 @@ final class HttpIngest implements IngestContract
             // LazyValue (and anything else JsonSerializable) into a plain,
             // natively serializable value -- exactly what would happen
             // anyway once the batch is eventually sent over HTTP.
+            //
+            // json_encode() is also what *invokes* those closures, so this
+            // has to catch Throwable and not just JsonException: a resolver
+            // can fail with anything -- e.g. a QueryException out of the
+            // "user" resolver when digest() runs from terminate() with the
+            // database connection already torn down. On the synchronous path
+            // that encode happened inside Guzzle, inside the catch-all in
+            // transmitBatch(), so it was always contained and logged.
             try {
+                /** @var array<int, array<mixed>> $records */
                 $records = json_decode(
                     json_encode($records, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE),
                     true,
                     flags: JSON_THROW_ON_ERROR
                 );
-            } catch (JsonException $e) {
+            } catch (Throwable $e) {
                 Log::error('Laraowl Ingest Error: failed to prepare records for queueing: '.$e->getMessage());
 
                 return;
@@ -136,21 +144,30 @@ final class HttpIngest implements IngestContract
 
     /**
      * Push the transmit job with sampling explicitly turned off in the
-     * context Laravel dehydrates into the job payload.
+     * context Laravel dehydrates into the job payload, and never let a queue
+     * failure escape.
      *
-     * Core::prepareForJob() restores the sampling flag from the payload, and
-     * Compatibility::getSamplingFromContext() defaults to *true* when the key
-     * is absent -- so the transmit job would otherwise run sampled. On a
-     * database queue connection the driver's own SQL (the reserve/pop on the
-     * way in, the delete on the way out) is captured by QuerySensor like any
-     * other query, so the next Looping event would digest those records and
-     * dispatch another transmit job, whose own driver SQL would do the same:
-     * an endless chain of jobs with no application traffic behind it.
-     * Marking the payload unsampled makes Core::finishExecution() flush()
-     * that buffer instead of digest()ing it, cutting the chain at the source.
-     * The TransmitRecords guards in QueuedJobSensor and JobAttemptSensor
-     * remain as a second line of defence for setups where the context never
-     * reaches the payload.
+     * Sampling: Core::prepareForJob() restores the sampling flag from the
+     * payload, and Compatibility::getSamplingFromContext() defaults to *true*
+     * when the key is absent -- so the transmit job would otherwise run
+     * sampled. On a database queue connection the driver's own SQL (the
+     * reserve/pop on the way in, the delete on the way out) is captured by
+     * QuerySensor like any other query, so the next Looping event would
+     * digest those records and dispatch another transmit job, whose own
+     * driver SQL would do the same: an endless chain of jobs with no
+     * application traffic behind it. Marking the payload unsampled makes
+     * Core::finishExecution() flush() that buffer instead of digest()ing it,
+     * cutting the chain at the source. The TransmitRecords guards in
+     * QueuedJobSensor and JobAttemptSensor remain as a second line of
+     * defence for setups where the context never reaches the payload.
+     *
+     * Failures: a missing or misconfigured connection ("Queue connection [x]
+     * is not configured") and an unreachable queue backend both throw out of
+     * dispatch(). digest()'s only catching caller is Core::finishExecution(),
+     * which hands the exception to LaraowlClient::unrecoverableExceptionOccurred()
+     * -- a no-op unless the application registered a handler -- so the batch
+     * would vanish with nothing in any log, while the synchronous path always
+     * logs. Log it the same way instead.
      */
     private function dispatchUnsampled(TransmitRecords $job): void
     {
@@ -169,6 +186,8 @@ final class HttpIngest implements IngestContract
             // shutdown). Dispatching explicitly pushes immediately and
             // removes that timing dependency entirely.
             app(Dispatcher::class)->dispatch($job);
+        } catch (Throwable $e) {
+            Log::error('Laraowl Ingest Error: failed to queue records: '.$e->getMessage()."\n".$e->getTraceAsString());
         } finally {
             if ($cachedSampling === null) {
                 Compatibility::removeSamplingFromContext();
