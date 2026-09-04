@@ -39,7 +39,7 @@ final class HttpIngest implements IngestContract
 
     public function writeNow(array $record): void
     {
-        $this->transmit([$record]);
+        $this->transmitBatch([$record]);
     }
 
     public function flush(): void
@@ -70,38 +70,35 @@ final class HttpIngest implements IngestContract
             return;
         }
 
-        /** @var ?string $connection */
-        $connection = config('laraowl.queue.connection');
-        /** @var ?string $queue */
-        $queue = config('laraowl.queue.queue');
+        /** @var array{connection?: ?string, queue?: ?string, delay?: int} $queueConfig */
+        $queueConfig = config('laraowl.queue', []);
+        $connection = $queueConfig['connection'] ?? null;
 
-        if ($connection || $queue) {
-            /** @var int $delay */
-            $delay = config('laraowl.queue.delay', 0);
-
-            TransmitRecords::dispatch($records)
+        if ($connection) {
+            $job = TransmitRecords::dispatch($records)
                 ->onConnection($connection)
-                ->onQueue($queue)
-                ->delay(now()->addSeconds($delay));
+                ->onQueue($queueConfig['queue'] ?? null);
+
+            if ($delay = $queueConfig['delay'] ?? 0) {
+                $job->delay(now()->addSeconds($delay));
+            }
 
             return;
         }
 
-        // No queue configured: fall back to the synchronous transmit, same as
-        // Telescope falling back to sync when TELESCOPE_QUEUE is empty.
-        $this->transmit($records);
+        // No queue connection configured: fall back to the synchronous
+        // transmit, same as Telescope falling back to sync when
+        // TELESCOPE_QUEUE is empty. LARAOWL_QUEUE only takes effect once
+        // LARAOWL_QUEUE_CONNECTION opts into queueing.
+        $this->transmitBatch($records);
     }
 
     /**
      * @internal Used by {@see TransmitRecords} to send an already-bufferred
-     * batch from the queue worker.
+     * batch from the queue worker, and by the synchronous fallback in
+     * {@see digest()}.
      */
     public function transmitBatch(array $records): void
-    {
-        $this->transmit($records);
-    }
-
-    private function transmit(array $records): void
     {
         $client = new Client([
             'base_uri' => $this->endpoint,
